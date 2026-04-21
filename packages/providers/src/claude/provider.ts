@@ -82,8 +82,9 @@ function normalizeClaudeUsage(usage?: {
  * - ~/.archon/.env loaded with override:true as the trusted source
  */
 function buildSubprocessEnv(): NodeJS.ProcessEnv {
+  // Using || intentionally: empty string should be treated as missing credential
   const hasExplicitTokens = Boolean(
-    process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.CLAUDE_API_KEY
+    process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.CLAUDE_API_KEY
   );
   const authMode = hasExplicitTokens ? 'explicit' : 'global';
   getLog().info(
@@ -381,6 +382,9 @@ async function applyNodeConfig(
     if (Object.keys(builtHooks).length > 0) {
       // Merge with existing hooks (PostToolUse capture hook)
       const existingHooks = options.hooks as SDKHooksMap | undefined;
+      if (!options.hooks) {
+        (options as Record<string, unknown>).hooks = {};
+      }
       for (const [event, matchers] of Object.entries(builtHooks)) {
         if (!matchers) continue;
         const existing = existingHooks?.[event] as HookCallbackMatcher[] | undefined;
@@ -448,6 +452,32 @@ async function applyNodeConfig(
       options.allowedTools = [...(options.allowedTools ?? []), 'Skill'];
     }
     getLog().info({ skills, agentId }, 'claude.skills_agent_created');
+  }
+
+  // agents → inline AgentDefinition pass-through.
+  // Runs AFTER skills: so user-defined agents win on ID collision with
+  // the internal 'dag-node-skills' wrapper.
+  // options.agent is intentionally left alone — inline agents are sub-agents
+  // invokable via the Task tool, not the primary agent for the query.
+  if (nodeConfig.agents) {
+    // Warn loudly when a user-defined agent overrides the internal
+    // 'dag-node-skills' wrapper set by the skills: block above. The
+    // merge is by design (user wins) but silent capability removal
+    // is the exact failure mode we want to avoid.
+    if (
+      Object.hasOwn(nodeConfig.agents, 'dag-node-skills') &&
+      options.agents?.['dag-node-skills'] !== undefined
+    ) {
+      getLog().warn(
+        { nodeSkills: nodeConfig.skills ?? [] },
+        'claude.inline_agents_override_skills_wrapper'
+      );
+    }
+    options.agents = {
+      ...(options.agents ?? {}),
+      ...(nodeConfig.agents as NonNullable<Options['agents']>),
+    };
+    getLog().info({ agentIds: Object.keys(nodeConfig.agents) }, 'claude.inline_agents_registered');
   }
 
   // effort
@@ -740,6 +770,7 @@ async function* streamClaudeMessages(
         total_cost_usd?: number;
         stop_reason?: string | null;
         num_turns?: number;
+        errors?: string[];
         model_usage?: Record<
           string,
           {
@@ -751,9 +782,15 @@ async function* streamClaudeMessages(
         >;
       };
       const tokens = normalizeClaudeUsage(resultMsg.usage);
+      const sdkErrors = Array.isArray(resultMsg.errors) ? resultMsg.errors : undefined;
       if (resultMsg.is_error) {
         getLog().error(
-          { sessionId: resultMsg.session_id, errorSubtype: resultMsg.subtype },
+          {
+            sessionId: resultMsg.session_id,
+            errorSubtype: resultMsg.subtype,
+            stopReason: resultMsg.stop_reason,
+            errors: sdkErrors,
+          },
           'claude.result_is_error'
         );
       }
@@ -765,6 +802,7 @@ async function* streamClaudeMessages(
           ? { structuredOutput: resultMsg.structured_output }
           : {}),
         ...(resultMsg.is_error ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
+        ...(resultMsg.is_error && sdkErrors?.length ? { errors: sdkErrors } : {}),
         ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
         ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
         ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),

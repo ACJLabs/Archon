@@ -2199,6 +2199,17 @@ export interface components {
       };
       mcp?: string;
       skills?: string[];
+      agents?: {
+        [key: string]: {
+          description: string;
+          prompt: string;
+          model?: string;
+          tools?: string[];
+          disallowedTools?: string[];
+          skills?: string[];
+          maxTurns?: number;
+        };
+      };
       /** @enum {string} */
       effort?: 'low' | 'medium' | 'high' | 'max';
       thinking?:
@@ -2337,7 +2348,7 @@ export interface components {
       nodes: components['schemas']['DagNode'][];
     };
     /** @enum {string} */
-    WorkflowSource: 'project' | 'bundled';
+    WorkflowSource: 'project' | 'bundled' | 'global';
     WorkflowListEntry: {
       workflow: components['schemas']['WorkflowDefinition'];
       source: components['schemas']['WorkflowSource'];

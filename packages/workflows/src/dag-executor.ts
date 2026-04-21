@@ -5,9 +5,8 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { resolve } from 'path';
 import { execFileAsync } from '@archon/git';
-import { discoverScripts } from './script-discovery';
+import { discoverScriptsForCwd } from './script-discovery';
 import type {
   IWorkflowPlatform,
   WorkflowMessageMetadata,
@@ -285,6 +284,7 @@ async function resolveNodeProviderAndModel(
     ['hooks', 'hooks', node.hooks !== undefined],
     ['mcp', 'mcp', node.mcp !== undefined],
     ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
+    ['agents', 'agents', node.agents !== undefined],
     ['effort', 'effortControl', (node.effort ?? workflowLevelOptions.effort) !== undefined],
     ['thinking', 'thinkingControl', (node.thinking ?? workflowLevelOptions.thinking) !== undefined],
     ['maxBudgetUsd', 'costControl', node.maxBudgetUsd !== undefined],
@@ -317,6 +317,23 @@ async function resolveNodeProviderAndModel(
     }
   }
 
+  // Surface agents + skills ID collision — user-defined 'dag-node-skills'
+  // silently overrides Archon's skills wrapper. User wins (by design) but
+  // the operator should know they've neutered the wrapper.
+  if (
+    node.agents?.['dag-node-skills'] !== undefined &&
+    node.skills !== undefined &&
+    node.skills.length > 0
+  ) {
+    getLog().warn({ nodeId: node.id }, 'dag.agents_skills_id_collision');
+    await safeSendMessage(
+      platform,
+      conversationId,
+      `Warning: Node '${node.id}' defines an agent with reserved ID 'dag-node-skills' AND uses 'skills:'. Your inline agent overrides Archon's automatic skills wrapper — the 'skills:' field will NOT take effect. Rename the agent or remove 'skills:' to fix.`,
+      { workflowId: workflowRunId, nodeName: node.id }
+    );
+  }
+
   // Build universal base options
   const baseOptions: SendQueryOptions = {};
   if (model) baseOptions.model = model;
@@ -336,6 +353,7 @@ async function resolveNodeProviderAndModel(
     mcp: node.mcp,
     hooks: node.hooks,
     skills: node.skills,
+    agents: node.agents,
     allowed_tools: node.allowed_tools,
     denied_tools: node.denied_tools,
     effort: node.effort ?? workflowLevelOptions.effort,
@@ -637,7 +655,19 @@ async function executeNodeInternal(
 
       if (msg.type === 'assistant' && msg.content) {
         nodeOutputText += msg.content; // ALWAYS capture for $node_id.output
-        if (streamingMode === 'stream') {
+        if (streamingMode === 'stream' || msg.flush) {
+          // `flush` chunks (e.g. Pi notify() emitting a plannotator review URL)
+          // must reach the user before the node blocks. Drain any queued batch
+          // content first so order is preserved.
+          if (streamingMode === 'batch' && batchMessages.length > 0) {
+            await safeSendMessage(
+              platform,
+              conversationId,
+              batchMessages.join('\n\n'),
+              nodeContext
+            );
+            batchMessages.length = 0;
+          }
           await safeSendMessage(platform, conversationId, msg.content, nodeContext);
         } else {
           batchMessages.push(msg.content);
@@ -763,6 +793,25 @@ async function executeNodeInternal(
           throw new Error(
             `Node '${node.id}' exceeded cost cap${cap !== undefined ? ` of $${cap.toFixed(2)}` : ''}.`
           );
+        }
+        // Fail loudly on any other SDK error result. Previously we broke out of
+        // the stream silently, producing empty/partial output without signaling
+        // failure — which let failed iterations masquerade as successes (#1208).
+        if (msg.isError) {
+          const subtype = msg.errorSubtype ?? 'unknown';
+          const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
+          getLog().error(
+            {
+              nodeId: node.id,
+              errorSubtype: subtype,
+              errors: msg.errors,
+              sessionId: msg.sessionId,
+              stopReason: msg.stopReason,
+              durationMs: Date.now() - nodeStartTime,
+            },
+            'dag.node_sdk_error_result'
+          );
+          throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
         }
         break; // Result is the "I'm done" signal — don't wait for subprocess to exit
       } else if (msg.type === 'system' && msg.content) {
@@ -1267,13 +1316,48 @@ async function executeScriptNode(
         args = ['run', ...withFlags, 'python', '-c', finalScript];
       }
     } else {
-      // Named script — look up in .archon/scripts/ directory
-      const scriptsDir = resolve(cwd, '.archon', 'scripts');
-      const scripts = await discoverScripts(scriptsDir);
+      // Named script — look up across repo and home scopes.
+      // Precedence: <cwd>/.archon/scripts/ > ~/.archon/scripts/ (repo wins).
+      // Wrap discovery in its own try/catch so a permission error on ~/.archon/scripts/
+      // isn't mis-attributed by the outer catch's "permission denied (check cwd
+      // permissions)" branch — that branch is for execFileAsync EACCES.
+      let scripts: Awaited<ReturnType<typeof discoverScriptsForCwd>>;
+      try {
+        scripts = await discoverScriptsForCwd(cwd);
+      } catch (discoveryErr) {
+        const err = discoveryErr as Error;
+        const errorMsg = `Script node '${node.id}': failed to discover scripts — ${err.message}`;
+        getLog().error({ err, nodeId: node.id, cwd }, 'script_discovery_failed');
+        await safeSendMessage(platform, conversationId, errorMsg, nodeContext);
+        await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
+
+        emitter.emit({
+          type: 'node_failed',
+          runId: workflowRun.id,
+          nodeId: node.id,
+          nodeName: node.id,
+          error: errorMsg,
+        });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_failed',
+            step_name: node.id,
+            data: { error: errorMsg, type: 'script' },
+          })
+          .catch((dbErr: Error) => {
+            getLog().error(
+              { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
+              'workflow_event_persist_failed'
+            );
+          });
+
+        return { state: 'failed', output: '', error: errorMsg };
+      }
       const scriptDef = scripts.get(finalScript);
 
       if (!scriptDef) {
-        const errorMsg = `Script node '${node.id}': named script '${finalScript}' not found in .archon/scripts/`;
+        const errorMsg = `Script node '${node.id}': named script '${finalScript}' not found in .archon/scripts/ or ~/.archon/scripts/`;
         getLog().error({ nodeId: node.id, scriptName: finalScript }, 'script_not_found');
         await safeSendMessage(platform, conversationId, errorMsg, nodeContext);
         await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
@@ -1625,6 +1709,28 @@ async function executeLoopNode(
           if (msg.stopReason !== undefined) loopFinalStopReason = msg.stopReason;
           if (msg.numTurns !== undefined) {
             loopTotalNumTurns = (loopTotalNumTurns ?? 0) + msg.numTurns;
+          }
+          // Fail the iteration loudly on SDK error results. Previously we broke
+          // silently, producing empty output and continuing to the next iteration —
+          // which made `error_during_execution` on resumed interactive loops look
+          // like a "5-second crash" that kept burning iterations (#1208).
+          if (msg.isError) {
+            const subtype = msg.errorSubtype ?? 'unknown';
+            const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
+            getLog().error(
+              {
+                nodeId: node.id,
+                iteration: i,
+                errorSubtype: subtype,
+                errors: msg.errors,
+                sessionId: msg.sessionId,
+                stopReason: msg.stopReason,
+              },
+              'loop_node.iteration_sdk_error'
+            );
+            throw new Error(
+              `Loop '${node.id}' iteration ${String(i)} failed: SDK returned ${subtype}${errorsDetail}`
+            );
           }
           break; // Result is the "I'm done" signal — don't wait for subprocess to exit
         } else if (msg.type === 'tool' && msg.toolName) {
@@ -2711,16 +2817,34 @@ export async function executeDagWorkflow(
   }
 
   if (anyFailed) {
+    if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
     const failedNodes = [...nodeOutputs.entries()]
       .filter(([, o]) => o.state === 'failed')
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
-    await safeSendMessage(
-      platform,
-      conversationId,
-      `\u26a0\ufe0f Some DAG nodes failed: ${failedNodes}\nSuccessful nodes completed normally.`,
-      { workflowId: workflowRun.id }
-    );
+    const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
+    await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
+      getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
+    });
+    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
+      getLog().error(
+        { err: logErr, workflowRunId: workflowRun.id },
+        'dag.workflow_error_log_write_failed'
+      );
+    });
+    const emitterForFail = getWorkflowEventEmitter();
+    emitterForFail.emit({
+      type: 'workflow_failed',
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      error: failMsg,
+    });
+    emitterForFail.unregisterRun(workflowRun.id);
+    await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
+      workflowId: workflowRun.id,
+    });
+    // DO NOT throw — outer executor.ts catch would duplicate workflow_failed events
+    return;
   }
 
   // Check if status was changed externally (e.g. cancelled) before marking complete.
