@@ -101,12 +101,72 @@ describe('bundled-defaults', () => {
       expect(content).toContain('workflow_name');
     });
 
+    it('archon-adversarial-dev init-workspace should avoid non-portable sed -i', () => {
+      const content = BUNDLED_WORKFLOWS['archon-adversarial-dev'];
+      expect(content).toContain('STATE_TMP="$ARTIFACTS/state.json.tmp"');
+      expect(content).toContain(
+        'sed "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/" "$ARTIFACTS/state.json" > "$STATE_TMP"'
+      );
+      expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
+    });
+
     it('should have valid YAML structure', () => {
       for (const content of Object.values(BUNDLED_WORKFLOWS)) {
         expect(content).toContain('name:');
         expect(content).toContain('description:');
         expect(content.includes('nodes:')).toBe(true);
       }
+    });
+  });
+
+  describe('fork-safe PR creation (#2226)', () => {
+    // In a clone of a fork, gh commands without an explicit --repo resolve the
+    // base repo to the fork's UPSTREAM parent, publishing the user's diff
+    // against the upstream repo (accidental upstream PRs #1543/#1416). Every
+    // `gh pr create` invocation in the bundled defaults must pin `--repo` —
+    // and so must the create-flow-adjacent `gh pr list/edit/ready` calls that
+    // discover or mutate the just-created PR (an empty/unset --repo value does
+    // NOT fail: gh silently falls back to its default resolution, verified).
+    // `gh pr view` is intentionally NOT guarded here: review-path commands
+    // (archon-pr-review-scope etc.) view explicit PR numbers supplied as
+    // workflow input — pinning those is a separate concern.
+
+    // Join backslash-continued shell lines so multi-line `gh pr create \`
+    // blocks are checked as a single command.
+    const mergeContinuations = (content: string): string[] => {
+      const merged: string[] = [];
+      let current = '';
+      for (const line of content.split('\n')) {
+        if (line.trimEnd().endsWith('\\')) {
+          current += line.trimEnd().slice(0, -1) + ' ';
+        } else {
+          merged.push(current + line);
+          current = '';
+        }
+      }
+      if (current) merged.push(current);
+      return merged;
+    };
+
+    const GUARDED = /gh pr (create|list|edit|ready)\b/;
+
+    const assertPinned = (bundle: Record<string, string>): void => {
+      for (const [name, content] of Object.entries(bundle)) {
+        for (const line of mergeContinuations(content)) {
+          if (!GUARDED.test(line)) continue;
+          // Prose references to a failed command (hook texts) are not invocations.
+          if (line.includes('gh pr create failed')) continue;
+          expect(`${name}: ${line.trim()}`).toContain('--repo');
+        }
+      }
+    };
+
+    it('every gh pr create/list/edit/ready in bundled commands pins --repo', () => {
+      assertPinned(BUNDLED_COMMANDS);
+    });
+
+    it('every gh pr create/list/edit/ready in bundled workflows pins --repo', () => {
+      assertPinned(BUNDLED_WORKFLOWS);
     });
   });
 });

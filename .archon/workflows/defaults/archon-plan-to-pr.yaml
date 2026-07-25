@@ -42,7 +42,8 @@ nodes:
     command: archon-implement-tasks
     depends_on: [confirm-plan]
     context: fresh
-    model: claude-opus-4-6[1m]
+    provider: claude
+    model: large
 
   # ═══════════════════════════════════════════════════════════════════
   # PHASE 4: VALIDATE
@@ -63,58 +64,14 @@ nodes:
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════════
-  # PHASE 6: CODE REVIEW
+  # PHASE 6-7: CODE REVIEW + FIX (shared building block)
+  # Inlines archon-review-block: verify-pr-base -> review-scope -> sync ->
+  # 5 parallel review agents -> synthesize -> implement-fixes.
   # ═══════════════════════════════════════════════════════════════════
 
-  - id: review-scope
-    command: archon-pr-review-scope
+  - id: review
+    include: archon-review-block
     depends_on: [finalize-pr]
-    context: fresh
-
-  - id: sync
-    command: archon-sync-pr-with-main
-    depends_on: [review-scope]
-    context: fresh
-
-  - id: code-review
-    command: archon-code-review-agent
-    depends_on: [sync]
-    context: fresh
-
-  - id: error-handling
-    command: archon-error-handling-agent
-    depends_on: [sync]
-    context: fresh
-
-  - id: test-coverage
-    command: archon-test-coverage-agent
-    depends_on: [sync]
-    context: fresh
-
-  - id: comment-quality
-    command: archon-comment-quality-agent
-    depends_on: [sync]
-    context: fresh
-
-  - id: docs-impact
-    command: archon-docs-impact-agent
-    depends_on: [sync]
-    context: fresh
-
-  - id: synthesize
-    command: archon-synthesize-review
-    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
-    trigger_rule: one_success
-    context: fresh
-
-  # ═══════════════════════════════════════════════════════════════════
-  # PHASE 7: FIX REVIEW ISSUES
-  # ═══════════════════════════════════════════════════════════════════
-
-  - id: implement-fixes
-    command: archon-implement-review-fixes
-    depends_on: [synthesize]
-    context: fresh
 
   # ═══════════════════════════════════════════════════════════════════
   # PHASE 8: FINAL SUMMARY & FOLLOW-UP
@@ -122,5 +79,5 @@ nodes:
 
   - id: workflow-summary
     command: archon-workflow-summary
-    depends_on: [implement-fixes]
+    depends_on: [review]
     context: fresh

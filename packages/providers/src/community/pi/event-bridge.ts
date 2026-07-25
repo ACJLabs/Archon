@@ -1,6 +1,6 @@
 import { createLogger } from '@archon/paths';
-import type { AgentSession, AgentSessionEvent } from '@mariozechner/pi-coding-agent';
-import type { AssistantMessage, Usage } from '@mariozechner/pi-ai';
+import type { AgentSession, AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type { AssistantMessage, Usage } from '@earendil-works/pi-ai';
 
 import type { MessageChunk, TokenUsage } from '../../types';
 
@@ -92,7 +92,8 @@ export function serializeToolResult(result: unknown): string {
   if (typeof result === 'string') return result;
   try {
     return JSON.stringify(result);
-  } catch {
+  } catch (err) {
+    getLog().warn({ err }, 'pi.event-bridge.tool_result_serialize_failed');
     return String(result);
   }
 }
@@ -123,6 +124,27 @@ function isAssistantMessage(m: unknown): m is AssistantMessage {
 }
 
 /**
+ * Extract the concatenated text content of the last assistant message from a
+ * Pi session transcript (the fully-assembled version from agent_end.messages).
+ * Used by bridgeSession to detect streaming truncation: if the assembled text
+ * is longer than what was delivered via text_delta events, the gap is emitted
+ * as a corrective assistant chunk before the result chunk.
+ * Returns undefined when no assistant message is present.
+ */
+function extractLastAssistantText(messages: readonly unknown[]): string | undefined {
+  const last = [...messages].reverse().find(isAssistantMessage);
+  if (!last) return undefined;
+  // AssistantMessage.content is (TextContent | ThinkingContent | ToolCall)[].
+  // Filter to text blocks only; thinking and tool-call blocks are not streamed
+  // as assistant chunks so they are excluded from the gap calculation.
+  const blocks = last.content as { type: string; text?: string }[];
+  return blocks
+    .filter(b => b.type === 'text')
+    .map(b => b.text ?? '')
+    .join('');
+}
+
+/**
  * Build the terminal `result` chunk from the final `agent_end` event. Pulls
  * usage/stopReason/error from the last assistant message in the returned
  * transcript. When the agent ended in error, surfaces it as `isError: true`.
@@ -146,37 +168,34 @@ export function buildResultChunk(messages: readonly unknown[]): MessageChunk {
     tokens,
     ...(tokens.cost !== undefined ? { cost: tokens.cost } : {}),
     ...(last.stopReason ? { stopReason: last.stopReason } : {}),
-    ...(isError ? { isError: true, errorSubtype: last.stopReason } : {}),
+    ...(isError
+      ? {
+          isError: true,
+          errorSubtype: last.stopReason,
+          // Surfacing errorMessage in errors[] is what makes the executor's
+          // transient-error classifier (which pattern-matches on the thrown
+          // message) able to retry Pi-side 429/overload failures.
+          ...(last.errorMessage ? { errors: [last.errorMessage] } : {}),
+        }
+      : {}),
   };
+  if (isError) {
+    // Intentional design: error chunks are yielded, not thrown. isError:true in the chunk
+    // is the signal — callers (bridgeSession, dag-executor) check result.isError to classify
+    // failures and still receive full token/stopReason context from the same chunk.
+    getLog().error(
+      { stopReason: last.stopReason, errorMessage: last.errorMessage },
+      'pi.result_chunk_error'
+    );
+  }
   return chunk;
 }
 
-/**
- * Attempt to parse a Pi assistant transcript as the structured-output JSON
- * requested via `outputFormat`. Handles two common model failure modes:
- *  - trailing/leading whitespace (always stripped)
- *  - markdown code fences (```json ... ``` or bare ``` ... ```) that models
- *    emit despite the "no code fences" instruction in the prompt
- *
- * Returns the parsed value on success, `undefined` on any failure. Callers
- * treat `undefined` as "structured output unavailable" and degrade via the
- * dag-executor's existing missing-structured-output warning.
- */
-export function tryParseStructuredOutput(text: string): unknown {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return undefined;
-  // Strip ```json / ``` fences if present. Match only at boundaries so we
-  // don't mangle JSON strings that legitimately contain backticks.
-  const cleaned = trimmed
-    .replace(/^```(?:json)?\s*\n?/i, '')
-    .replace(/\n?\s*```\s*$/, '')
-    .trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    return undefined;
-  }
-}
+// Structured-output parsing is shared across providers. Import once for local
+// use and re-export so existing callers and tests keep their import path
+// stable; new providers should import from `../../shared/structured-output`.
+import { tryParseStructuredOutput } from '../../shared/structured-output';
+export { tryParseStructuredOutput };
 
 /**
  * Pure mapper from Pi's `AgentSessionEvent` → zero-or-more Archon `MessageChunk`s.
@@ -247,17 +266,6 @@ export function mapPiEvent(event: AgentSessionEvent): MessageChunk[] {
 }
 
 /**
- * Bridge a Pi `AgentSession` into Archon's `AsyncGenerator<MessageChunk>` contract.
- *
- * Behavior:
- *  - subscribe before calling prompt, unsubscribe in finally
- *  - yield mapped events in order
- *  - complete on successful `session.prompt()` resolution
- *  - throw on `session.prompt()` rejection or listener-raised errors
- *  - forward `abortSignal` to `session.abort()` fire-and-forget
- *  - always `dispose()` the session to avoid listener accumulation
- */
-/**
  * Internal queue payload for `bridgeSession`. Exported at module scope
  * (not inside the generator) so unit tests can exercise each variant
  * independently without reaching into the generator's closure.
@@ -272,6 +280,17 @@ export interface BridgeNotifier {
   setEmitter(fn: ((chunk: MessageChunk) => void) | undefined): void;
 }
 
+/**
+ * Bridge a Pi `AgentSession` into Archon's `AsyncGenerator<MessageChunk>` contract.
+ *
+ * Behavior:
+ *  - subscribe before calling prompt, unsubscribe in finally
+ *  - yield mapped events in order
+ *  - complete on successful `session.prompt()` resolution
+ *  - throw on `session.prompt()` rejection or listener-raised errors
+ *  - forward `abortSignal` to `session.abort()` fire-and-forget
+ *  - always `dispose()` the session to avoid listener accumulation
+ */
 export async function* bridgeSession(
   session: AgentSession,
   prompt: string,
@@ -280,7 +299,31 @@ export async function* bridgeSession(
   uiBridge?: BridgeNotifier
 ): AsyncGenerator<MessageChunk> {
   const queue = new AsyncQueue<BridgeQueueItem>();
+
+  // ── Assistant-chunk coalescing (#1814) ─────────────────────────────────
+  // Pi streams assistant text as many tiny `text_delta` events (often a few
+  // characters each). Downstream, the DAG executor treats every `assistant`
+  // chunk as a discrete message block — batch mode joins them with "\n\n",
+  // stream mode sends each one separately. That is correct for Claude/Codex,
+  // which each yield one chunk per *complete* text block, but it shatters Pi's
+  // char-level deltas into fragmented "С\n\nег\n\nод\n\nня" output. We coalesce
+  // consecutive deltas into one block-level chunk and flush it only at natural
+  // boundaries (turn start, text-block end, before any non-assistant chunk, and
+  // at end-of-stream/error), so Pi matches the one-chunk-per-block contract the
+  // executor already expects. `currentTurnText`/`assistantBuffer` still
+  // accumulate every delta, so streaming-tail detection and structured-output
+  // buffering are unaffected.
+  let pendingAssistant = '';
+  const flushPendingAssistant = (): void => {
+    if (pendingAssistant.length === 0) return;
+    queue.push({ kind: 'chunk', chunk: { type: 'assistant', content: pendingAssistant } });
+    pendingAssistant = '';
+  };
+
   uiBridge?.setEmitter(chunk => {
+    // A notify() chunk (flush:true) must surface immediately and in order, so
+    // drain any buffered assistant text ahead of it.
+    flushPendingAssistant();
     queue.push({ kind: 'chunk', chunk });
   });
   // Best-effort structured-output buffer. Only accumulates when the caller
@@ -288,14 +331,45 @@ export async function* bridgeSession(
   // passes through untouched.
   const wantsStructured = jsonSchema !== undefined;
   let assistantBuffer = '';
+  // Track text streamed via text_delta for the current assistant turn.
+  // Reset at each turn_start so only the final turn's text is compared
+  // against finalAssembledText (see streaming-tail completion below).
+  let currentTurnText = '';
+  // Assembled text of the final assistant message from agent_end.messages.
+  // Set synchronously inside the subscribe callback before the result chunk
+  // is pushed to the queue, so it is always ready when the yield loop
+  // processes the result.
+  let finalAssembledText: string | undefined;
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     try {
+      if (event.type === 'turn_start') {
+        // A new turn begins: the previous turn's text block is complete.
+        flushPendingAssistant();
+        currentTurnText = '';
+      }
+      if (event.type === 'agent_end') {
+        finalAssembledText = extractLastAssistantText(event.messages);
+      }
       for (const chunk of mapPiEvent(event)) {
-        if (wantsStructured && chunk.type === 'assistant') {
-          assistantBuffer += chunk.content;
+        if (chunk.type === 'assistant') {
+          // Coalesce char-level deltas; hold them until a boundary flush so the
+          // executor receives one block-level chunk instead of dozens of tiny
+          // ones. The accumulators below still observe every delta.
+          currentTurnText += chunk.content;
+          if (wantsStructured) assistantBuffer += chunk.content;
+          pendingAssistant += chunk.content;
+        } else {
+          // Any non-assistant chunk (tool, tool_result, system, result) is a
+          // boundary: drain buffered text first so ordering is preserved.
+          flushPendingAssistant();
+          queue.push({ kind: 'chunk', chunk });
         }
-        queue.push({ kind: 'chunk', chunk });
+      }
+      // A completed text block flushes promptly so stream-mode consumers see
+      // each block as it finishes rather than waiting for the terminal result.
+      if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_end') {
+        flushPendingAssistant();
       }
     } catch (err) {
       queue.push({ kind: 'error', error: err as Error });
@@ -329,14 +403,58 @@ export async function* bridgeSession(
 
   try {
     for await (const item of queue) {
-      if (item.kind === 'done') return;
-      if (item.kind === 'error') throw item.error;
+      if (item.kind === 'done') {
+        // Defensive: agent_end normally flushes buffered text via its result
+        // chunk before `done` arrives, but surface any stranded text rather
+        // than dropping it.
+        if (pendingAssistant.length > 0) {
+          yield { type: 'assistant', content: pendingAssistant };
+          pendingAssistant = '';
+        }
+        return;
+      }
+      if (item.kind === 'error') {
+        // Preserve partial output: emit whatever text was buffered before the
+        // failure so it still reaches the user instead of being discarded.
+        if (pendingAssistant.length > 0) {
+          yield { type: 'assistant', content: pendingAssistant };
+          pendingAssistant = '';
+        }
+        throw item.error;
+      }
       // Annotate the terminal result chunk with Pi's session UUID so Archon's
       // orchestrator can pass it back as `resumeSessionId` on the next call.
       // Pi's session.sessionId is always a UUID (even for in-memory); we emit
       // it unconditionally and let the caller decide whether resume is
       // meaningful (capability-gated at the registry level).
       if (item.chunk.type === 'result') {
+        // Streaming tail completion: Pi occasionally fails to flush the last
+        // characters of an assistant turn as text_delta events, leaving them
+        // present only in agent_end.messages. Detect the gap and emit the
+        // missing suffix as a corrective assistant chunk so the orchestrator's
+        // allMessages accumulator receives the full command text.
+        // Condition: assembled text is strictly longer, starts with what was
+        // streamed (ensuring we emit an extension, not a replacement), and is
+        // not undefined (no assistant message in transcript — treated as clean).
+        if (
+          finalAssembledText !== undefined &&
+          finalAssembledText.length > currentTurnText.length &&
+          finalAssembledText.startsWith(currentTurnText)
+        ) {
+          const tail = finalAssembledText.slice(currentTurnText.length);
+          yield { type: 'assistant', content: tail };
+          if (wantsStructured) {
+            assistantBuffer += tail;
+          }
+          getLog().warn(
+            {
+              streamedLen: currentTurnText.length,
+              assembledLen: finalAssembledText.length,
+              tailLen: tail.length,
+            },
+            'pi.event-bridge.streaming_tail_completed'
+          );
+        }
         let terminal: MessageChunk = item.chunk;
         if (session.sessionId) {
           terminal = { ...terminal, sessionId: session.sessionId };
@@ -379,9 +497,19 @@ export async function* bridgeSession(
       // debug so SDK regressions surface without polluting normal output.
       getLog().debug({ err }, 'pi.event-bridge.dispose_failed');
     }
-    // Ensure the prompt promise settles so callers see no dangling work.
-    await promptPromise.catch(() => {
-      /* errors already surfaced through the queue */
+    // Don't await promptPromise. The queue is closed above (line 392), and the
+    // .then() handlers attached at construction (line 344) only push to that
+    // queue — closed pushes are no-ops. There's nothing the caller is waiting
+    // for; whether prompt() resolves in 1ms or never, no observable behavior
+    // changes. Awaiting it is what caused #1561: Pi's session.prompt() can
+    // hang indefinitely after dispose(), keeping generator.return() suspended,
+    // draining Bun's event loop, and exiting with code 0 mid-workflow.
+    //
+    // Attach .catch() defensively so a stray async rejection (the .then()
+    // handlers should preclude this, but belt-and-suspenders) doesn't bubble
+    // up as an unhandled-rejection process exit.
+    promptPromise.catch((err: unknown) => {
+      getLog().debug({ err }, 'pi.event-bridge.prompt_rejected_after_close');
     });
   }
 }

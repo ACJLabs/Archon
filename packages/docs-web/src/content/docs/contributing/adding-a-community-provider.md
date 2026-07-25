@@ -98,6 +98,9 @@ export class YourProvider implements IAgentProvider {
     // 4. Translate nodeConfig to SDK options (only for capabilities you declared)
     // 5. Invoke SDK, yield normalized MessageChunks
     // 6. Include sessionId in final `result` chunk (for resume)
+    // 7. If you support resume, wrap the stream with `withResumedOutcome`
+    //    (../../shared/resumed) so a cold resume is stamped resumed:false and
+    //    surfaced by the executor instead of silently starting fresh.
   }
 
   getType() { return 'your-id'; }
@@ -124,7 +127,6 @@ export function registerYourProvider(): void {
     displayName: 'Your Provider (community)',
     factory: () => new YourProvider(),
     capabilities: YOUR_CAPABILITIES,
-    isModelCompatible: (model) => /* pattern check */,
     builtIn: false, // ← important: community providers are NOT built-in
   });
 }
@@ -147,7 +149,7 @@ Co-locate tests next to your code. The Pi tests use this isolation pattern:
 
 - Mock the SDK (`mock.module` at the top of the file, before importing your provider).
 - Tests that touch `mock.module` are split into separate `bun test` invocations in `packages/providers/package.json` (see existing entries for the Pi files). Bun's `mock.module` is process-global and irreversible — splitting prevents cross-file pollution.
-- Registry test (`packages/providers/src/registry.test.ts`): add a `describe` block asserting `builtIn: false`, idempotent registration, and `isModelCompatible` behavior.
+- Registry test (`packages/providers/src/registry.test.ts`): add a `describe` block asserting `builtIn: false` and idempotent registration.
 
 ### 5. Capability discipline
 
